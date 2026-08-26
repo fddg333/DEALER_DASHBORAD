@@ -29,6 +29,13 @@ const styles = {
   dealerName: { fontWeight: 600, fontSize: 15 },
   sectionTitle: { fontSize: 12, color: '#8f8d84', margin: '10px 0 6px', textTransform: 'uppercase', letterSpacing: '0.03em' },
   empty: { color: '#8f8d84', fontSize: 13, padding: '16px 0', textAlign: 'center' },
+  reminderGroup: { marginBottom: 18 },
+  reminderGroupTitle: (color) => ({ fontSize: 13, fontWeight: 600, color, margin: '0 0 8px', display: 'flex', alignItems: 'center', gap: 6 }),
+  reminderRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', border: '0.5px solid #e1ded4', borderRadius: 8, marginBottom: 8, background: '#fafaf7' },
+  reminderName: { fontWeight: 600, fontSize: 14 },
+  reminderMeta: { color: '#8f8d84', fontSize: 12, marginTop: 2 },
+  waButton: { background: '#25D366', color: '#fff', border: 'none', cursor: 'pointer', padding: '7px 14px', fontWeight: 500, borderRadius: 6, fontSize: 12.5, display: 'flex', alignItems: 'center', gap: 6 },
+  waButtonDisabled: { background: '#c9c5b8', color: '#fff', cursor: 'not-allowed', padding: '7px 14px', fontWeight: 500, borderRadius: 6, fontSize: 12.5, border: 'none' },
 };
 
 function fmt(n) {
@@ -39,6 +46,44 @@ function totals(d) {
   const purchased = (d.purchases || []).reduce((s, p) => s + p.qty * p.rate, 0);
   const paid = (d.payments || []).reduce((s, p) => s + p.amount, 0);
   return { purchased, paid, pending: purchased - paid };
+}
+
+function daysBetween(dateStr) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const due = new Date(dateStr); due.setHours(0, 0, 0, 0);
+  return Math.round((due - today) / (1000 * 60 * 60 * 24));
+}
+
+// Earliest due_date among a dealer's purchases (only meaningful while pending > 0)
+function nextDueDate(d) {
+  const dates = (d.purchases || []).map((p) => p.due_date).filter(Boolean).sort();
+  return dates.length ? dates[0] : null;
+}
+
+function reminderStatus(d) {
+  const t = totals(d);
+  if (t.pending <= 0) return null;
+  const due = nextDueDate(d);
+  if (!due) return null;
+  const days = daysBetween(due);
+  if (days < 0) return { bucket: 'overdue', days: Math.abs(days), due, pending: t.pending };
+  if (days <= 7) return { bucket: 'week', days, due, pending: t.pending };
+  return { bucket: 'upcoming', days, due, pending: t.pending };
+}
+
+function waMessage(dealer, status) {
+  const amt = fmt(status.pending);
+  let timing;
+  if (status.bucket === 'overdue') timing = `was due ${status.days} day${status.days === 1 ? '' : 's'} ago (${status.due})`;
+  else if (status.bucket === 'week') timing = status.days === 0 ? 'is due today' : `is due in ${status.days} day${status.days === 1 ? '' : 's'} (${status.due})`;
+  else timing = `is due on ${status.due}`;
+  return `Hi ${dealer.name}, this is a reminder from BM Tiles that a payment of ${amt} ${timing}. Please arrange payment at your earliest convenience. Thank you!`;
+}
+
+function waLink(dealer, status) {
+  const phone = (dealer.phone || '').replace(/[^0-9]/g, '');
+  if (!phone) return null;
+  return `https://wa.me/${phone}?text=${encodeURIComponent(waMessage(dealer, status))}`;
 }
 
 export default function Dashboard() {
@@ -101,9 +146,9 @@ export default function Dashboard() {
     await fetch('/api/purchases', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dealer_id: dealerId, product, qty, rate, date: f.pdate }),
+      body: JSON.stringify({ dealer_id: dealerId, product, qty, rate, date: f.pdate, due_date: f.duedate }),
     });
-    setFormState((s) => ({ ...s, [dealerId]: { ...s[dealerId], product: '', qty: '', rate: '', pdate: '' } }));
+    setFormState((s) => ({ ...s, [dealerId]: { ...s[dealerId], product: '', qty: '', rate: '', pdate: '', duedate: '' } }));
     await load();
     setOpenIds((o) => ({ ...o, [dealerId]: true }));
   }
@@ -172,6 +217,53 @@ export default function Dashboard() {
         {dealerErr && <div style={styles.err}>{dealerErr}</div>}
       </div>
 
+      {(() => {
+        const withStatus = dealers
+          .map((d) => ({ dealer: d, status: reminderStatus(d) }))
+          .filter((x) => x.status);
+        const overdue = withStatus.filter((x) => x.status.bucket === 'overdue').sort((a, b) => b.status.days - a.status.days);
+        const week = withStatus.filter((x) => x.status.bucket === 'week').sort((a, b) => a.status.days - b.status.days);
+        const upcoming = withStatus.filter((x) => x.status.bucket === 'upcoming').sort((a, b) => a.status.days - b.status.days);
+
+        if (!loading && withStatus.length === 0) return null;
+
+        const renderGroup = (title, color, items, describeDay) => {
+          if (!items.length) return null;
+          return (
+            <div style={styles.reminderGroup}>
+              <div style={styles.reminderGroupTitle(color)}>{title} ({items.length})</div>
+              {items.map(({ dealer, status }) => {
+                const link = waLink(dealer, status);
+                return (
+                  <div key={dealer.id} style={styles.reminderRow}>
+                    <div>
+                      <div style={styles.reminderName}>{dealer.name}</div>
+                      <div style={styles.reminderMeta}>{fmt(status.pending)} pending · {describeDay(status)}</div>
+                    </div>
+                    {link ? (
+                      <a href={link} target="_blank" rel="noopener noreferrer" style={{ textDecoration: 'none' }}>
+                        <button style={styles.waButton}>Send WhatsApp</button>
+                      </a>
+                    ) : (
+                      <button style={styles.waButtonDisabled} disabled title="Add a phone number for this dealer">No phone</button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        };
+
+        return (
+          <div style={styles.card}>
+            <h2 style={styles.cardTitle}>Payment reminders</h2>
+            {renderGroup('Overdue', '#a32d2d', overdue, (s) => `${s.days} day${s.days === 1 ? '' : 's'} overdue`)}
+            {renderGroup('Due this week', '#b8860b', week, (s) => s.days === 0 ? 'due today' : `due in ${s.days} day${s.days === 1 ? '' : 's'}`)}
+            {renderGroup('Upcoming', '#6b6a63', upcoming, (s) => `due ${s.due}`)}
+          </div>
+        );
+      })()}
+
       <div style={styles.card}>
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
           <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={load}>Refresh</button>
@@ -211,12 +303,12 @@ export default function Dashboard() {
                       <tr>
                         <th style={styles.th}>Product</th><th style={styles.th}>Qty</th>
                         <th style={styles.th}>Rate</th><th style={styles.th}>Amount</th>
-                        <th style={styles.th}>Date</th><th style={styles.th}></th>
+                        <th style={styles.th}>Date</th><th style={styles.th}>Due</th><th style={styles.th}></th>
                       </tr>
                     </thead>
                     <tbody>
                       {(d.purchases || []).length === 0 && (
-                        <tr><td colSpan={6} style={styles.empty}>No purchases logged</td></tr>
+                        <tr><td colSpan={7} style={styles.empty}>No purchases logged</td></tr>
                       )}
                       {(d.purchases || []).map((p) => (
                         <tr key={p.id}>
@@ -225,6 +317,7 @@ export default function Dashboard() {
                           <td style={styles.td}>{fmt(p.rate)}</td>
                           <td style={styles.td}>{fmt(p.qty * p.rate)}</td>
                           <td style={styles.td}>{p.date}</td>
+                          <td style={styles.td}>{p.due_date || '—'}</td>
                           <td style={styles.td}>
                             <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePurchase(p.id)}>Remove</button>
                           </td>
@@ -236,9 +329,11 @@ export default function Dashboard() {
                     <input style={{ ...styles.input }} placeholder="Product (e.g. Zara White basin)" value={f.product || ''} onChange={(e) => setField(d.id, 'product', e.target.value)} />
                     <input style={{ ...styles.input, maxWidth: 80 }} type="number" min="1" placeholder="Qty" value={f.qty || ''} onChange={(e) => setField(d.id, 'qty', e.target.value)} />
                     <input style={{ ...styles.input, maxWidth: 100 }} type="number" min="0" placeholder="Rate ₹" value={f.rate || ''} onChange={(e) => setField(d.id, 'rate', e.target.value)} />
-                    <input style={{ ...styles.input, maxWidth: 150 }} type="date" value={f.pdate || ''} onChange={(e) => setField(d.id, 'pdate', e.target.value)} />
+                    <input style={{ ...styles.input, maxWidth: 150 }} type="date" value={f.pdate || ''} onChange={(e) => setField(d.id, 'pdate', e.target.value)} title="Purchase date" />
+                    <input style={{ ...styles.input, maxWidth: 150 }} type="date" value={f.duedate || ''} onChange={(e) => setField(d.id, 'duedate', e.target.value)} title="Payment due date" />
                     <button style={styles.button} onClick={() => addPurchase(d.id)}>Add purchase</button>
                   </div>
+                  <div style={{ fontSize: 11.5, color: '#8f8d84', marginTop: -4, marginBottom: 6 }}>Second date field is the payment due date, used for reminders.</div>
                   {errs[d.id + '-p'] && <div style={styles.err}>{errs[d.id + '-p']}</div>}
 
                   <div style={styles.sectionTitle}>Payments</div>
