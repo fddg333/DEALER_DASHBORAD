@@ -3,7 +3,7 @@ import { supabaseServer } from '@/lib/supabaseClient';
 
 export async function POST(req) {
   const body = await req.json();
-  const { dealer_id, product, qty, rate, date } = body;
+  const { dealer_id, product, qty, rate, date, due_date } = body;
 
   const product_ = (product || '').trim();
   const qty_ = Number(qty);
@@ -22,6 +22,7 @@ export async function POST(req) {
       qty: qty_,
       rate: rate_,
       date: date || new Date().toISOString().slice(0, 10),
+      due_date: due_date || null,
     })
     .select()
     .single();
@@ -29,3 +30,4 @@ export async function POST(req) {
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json({ purchase: data });
 }
+
