@@ -36,6 +36,7 @@ const styles = {
   reminderMeta: { color: '#8f8d84', fontSize: 12, marginTop: 2 },
   waButton: { background: '#25D366', color: '#fff', border: 'none', cursor: 'pointer', padding: '7px 14px', fontWeight: 500, borderRadius: 6, fontSize: 12.5, display: 'flex', alignItems: 'center', gap: 6 },
   waButtonDisabled: { background: '#c9c5b8', color: '#fff', cursor: 'not-allowed', padding: '7px 14px', fontWeight: 500, borderRadius: 6, fontSize: 12.5, border: 'none' },
+  sortTh: { textAlign: 'left', color: '#8f8d84', fontWeight: 500, fontSize: 12, padding: '6px 8px', borderBottom: '1px solid #e1ded4', cursor: 'pointer', userSelect: 'none' },
 };
 
 function fmt(n) {
@@ -95,6 +96,8 @@ export default function Dashboard() {
   const [dealerErr, setDealerErr] = useState('');
   const [formState, setFormState] = useState({}); // per-dealer purchase/payment form inputs
   const [errs, setErrs] = useState({});
+  const [sortKey, setSortKey] = useState('pending');
+  const [sortDir, setSortDir] = useState('desc');
 
   async function load() {
     setLoading(true);
@@ -186,6 +189,65 @@ export default function Dashboard() {
     window.location.href = '/login';
   }
 
+  function toggleSort(key) {
+    if (sortKey === key) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortKey(key);
+      setSortDir('desc');
+    }
+  }
+
+  async function exportToExcel() {
+    const XLSX = await import('xlsx');
+
+    const summaryRows = dealers.map((d) => {
+      const t = totals(d);
+      return {
+        'Dealer': d.name,
+        'Phone': d.phone || '',
+        'Total Billed': t.purchased,
+        'Total Paid': t.paid,
+        'Pending': t.pending,
+      };
+    });
+
+    const purchaseRows = [];
+    dealers.forEach((d) => {
+      (d.purchases || []).forEach((p) => {
+        purchaseRows.push({
+          'Dealer': d.name,
+          'Product': p.product,
+          'Qty': p.qty,
+          'Rate': p.rate,
+          'Amount': p.qty * p.rate,
+          'Purchase Date': p.date,
+          'Due Date': p.due_date || '',
+        });
+      });
+    });
+
+    const paymentRows = [];
+    dealers.forEach((d) => {
+      (d.payments || []).forEach((p) => {
+        paymentRows.push({
+          'Dealer': d.name,
+          'Amount': p.amount,
+          'Date': p.date,
+          'Note': p.note || '',
+        });
+      });
+    });
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'Dealers Summary');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(purchaseRows), 'Purchases');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(paymentRows), 'Payments');
+
+    const dateStr = new Date().toISOString().slice(0, 10);
+    XLSX.writeFile(wb, `bm-tiles-dealer-data-${dateStr}.xlsx`);
+  }
+
   const metricTotals = dealers.reduce((acc, d) => {
     const t = totals(d);
     acc.purchased += t.purchased; acc.paid += t.paid; acc.pending += t.pending;
@@ -196,7 +258,12 @@ export default function Dashboard() {
     <div style={styles.wrap}>
       <div style={styles.topBar}>
         <h1 style={styles.h1}>BM Tiles — dealer dashboard</h1>
-        <button style={styles.buttonSecondary} onClick={logout}>Log out</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button style={styles.buttonSecondary} onClick={exportToExcel} disabled={loading || dealers.length === 0}>
+            Export to Excel
+          </button>
+          <button style={styles.buttonSecondary} onClick={logout}>Log out</button>
+        </div>
       </div>
       <p style={styles.sub}>Track dealer purchases and pending payments in one place.</p>
 
@@ -260,6 +327,46 @@ export default function Dashboard() {
             {renderGroup('Overdue', '#a32d2d', overdue, (s) => `${s.days} day${s.days === 1 ? '' : 's'} overdue`)}
             {renderGroup('Due this week', '#b8860b', week, (s) => s.days === 0 ? 'due today' : `due in ${s.days} day${s.days === 1 ? '' : 's'}`)}
             {renderGroup('Upcoming', '#6b6a63', upcoming, (s) => `due ${s.due}`)}
+          </div>
+        );
+      })()}
+
+      {(() => {
+        if (loading || dealers.length === 0) return null;
+        const rows = dealers.map((d) => ({ dealer: d, ...totals(d) }));
+        const sorted = [...rows].sort((a, b) => {
+          let av, bv;
+          if (sortKey === 'name') { av = a.dealer.name.toLowerCase(); bv = b.dealer.name.toLowerCase(); }
+          else { av = a[sortKey]; bv = b[sortKey]; }
+          if (av < bv) return sortDir === 'asc' ? -1 : 1;
+          if (av > bv) return sortDir === 'asc' ? 1 : -1;
+          return 0;
+        });
+        const arrow = (key) => (sortKey === key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '');
+        return (
+          <div style={styles.card}>
+            <h2 style={styles.cardTitle}>Party-wise summary</h2>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={styles.sortTh} onClick={() => toggleSort('name')}>Dealer{arrow('name')}</th>
+                  <th style={styles.sortTh} onClick={() => toggleSort('purchased')}>Total billed{arrow('purchased')}</th>
+                  <th style={styles.sortTh} onClick={() => toggleSort('paid')}>Total collected{arrow('paid')}</th>
+                  <th style={styles.sortTh} onClick={() => toggleSort('pending')}>Pending{arrow('pending')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(({ dealer, purchased, paid, pending }) => (
+                  <tr key={dealer.id}>
+                    <td style={styles.td}>{dealer.name}</td>
+                    <td style={styles.td}>{fmt(purchased)}</td>
+                    <td style={{ ...styles.td, color: '#3b6d11' }}>{fmt(paid)}</td>
+                    <td style={{ ...styles.td, color: pending > 0 ? '#a32d2d' : '#3b6d11' }}>{fmt(pending)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ fontSize: 11.5, color: '#8f8d84', marginTop: 8 }}>Tap a column header to sort.</div>
           </div>
         );
       })()}
