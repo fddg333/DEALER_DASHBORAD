@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import ImportExcel from './ImportExcel';
 
 const styles = {
@@ -131,6 +131,9 @@ export default function Dashboard() {
   const [sortKey, setSortKey] = useState('pending');
   const [sortDir, setSortDir] = useState('desc');
   const [error, setError] = useState('');
+  const [importFile, setImportFile] = useState(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const importInputRef = useRef(null);
 
   async function load() {
     setLoading(true);
@@ -337,9 +340,27 @@ export default function Dashboard() {
     <div style={styles.wrap}>
       <div style={styles.topBar}>
         <h1 style={styles.h1}>BM Tiles — dealer dashboard</h1>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <button style={styles.buttonSecondary} onClick={exportToExcel} disabled={loading || dealers.length === 0}>
             Export to Excel
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const f = e.target.files && e.target.files[0];
+              e.target.value = ''; // let the same file be picked again
+              if (f) setImportFile(f);
+            }}
+          />
+          <button
+            style={styles.buttonSecondary}
+            onClick={() => importInputRef.current && importInputRef.current.click()}
+            disabled={importBusy}
+          >
+            {importBusy ? 'Reading…' : 'Import from Excel'}
           </button>
           <button style={styles.buttonSecondary} onClick={logout}>Log out</button>
         </div>
@@ -370,7 +391,12 @@ export default function Dashboard() {
         {dealerErr && <div style={styles.err}>{dealerErr}</div>}
       </div>
 
-      <ImportExcel existingNames={dealers.map((d) => d.name)} onImported={load} />
+      <ImportExcel
+        file={importFile}
+        onBusy={setImportBusy}
+        onClose={() => setImportFile(null)}
+        onImported={load}
+      />
 
       {(() => {
         const withStatus = dealers
