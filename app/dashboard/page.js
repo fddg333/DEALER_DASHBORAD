@@ -37,25 +37,10 @@ const styles = {
   waButton: { background: '#25D366', color: '#fff', border: 'none', cursor: 'pointer', padding: '7px 14px', fontWeight: 500, borderRadius: 6, fontSize: 12.5, display: 'flex', alignItems: 'center', gap: 6 },
   waButtonDisabled: { background: '#c9c5b8', color: '#fff', cursor: 'not-allowed', padding: '7px 14px', fontWeight: 500, borderRadius: 6, fontSize: 12.5, border: 'none' },
   sortTh: { textAlign: 'left', color: '#8f8d84', fontWeight: 500, fontSize: 12, padding: '6px 8px', borderBottom: '1px solid #e1ded4', cursor: 'pointer', userSelect: 'none' },
-  banner: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap', background: '#fcebeb', border: '0.5px solid #e6bcbc', color: '#a32d2d', borderRadius: 10, padding: '10px 14px', fontSize: 13.5, marginBottom: 16 },
 };
 
 function fmt(n) {
   return '₹' + Number(n || 0).toLocaleString('en-IN');
-}
-
-// Some failures stall rather than reject — a sleeping database, a phone that
-// wandered off the wifi. Without a deadline the request never settles and the
-// screen sits on "Loading…" forever.
-function withDeadline(ms) {
-  if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) return AbortSignal.timeout(ms);
-  const c = new AbortController();
-  setTimeout(() => c.abort(), ms);
-  return c.signal;
-}
-
-function isTimeout(e) {
-  return e && (e.name === 'TimeoutError' || e.name === 'AbortError');
 }
 
 function totals(d) {
@@ -70,26 +55,10 @@ function daysBetween(dateStr) {
   return Math.round((due - today) / (1000 * 60 * 60 * 24));
 }
 
-// Payments aren't tied to individual purchases, so settle them oldest-bill-first
-// and report the earliest due date among the bills the payments don't cover.
-// Using the earliest due date outright would age the balance against a bill the
-// dealer already cleared, and that number goes into the WhatsApp reminder.
+// Earliest due_date among a dealer's purchases (only meaningful while pending > 0)
 function nextDueDate(d) {
-  const bills = [...(d.purchases || [])].sort(
-    (a, b) => (a.date || '').localeCompare(b.date || '') || (a.created_at || '').localeCompare(b.created_at || '')
-  );
-  let credit = (d.payments || []).reduce((s, p) => s + p.amount, 0);
-  const unsettled = [];
-  for (const b of bills) {
-    const amount = b.qty * b.rate;
-    if (credit >= amount) {
-      credit -= amount; // this bill is fully paid off
-      continue;
-    }
-    credit = 0; // partially paid at most; the rest of the bills are open
-    if (b.due_date) unsettled.push(b.due_date);
-  }
-  return unsettled.length ? unsettled.sort()[0] : null;
+  const dates = (d.purchases || []).map((p) => p.due_date).filter(Boolean).sort();
+  return dates.length ? dates[0] : null;
 }
 
 function reminderStatus(d) {
@@ -129,46 +98,20 @@ export default function Dashboard() {
   const [errs, setErrs] = useState({});
   const [sortKey, setSortKey] = useState('pending');
   const [sortDir, setSortDir] = useState('desc');
-  const [error, setError] = useState('');
+  const [preview, setPreview] = useState(null);   // parsed file awaiting confirmation
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+  const [importError, setImportError] = useState('');
 
   async function load() {
     setLoading(true);
-    try {
-      const res = await fetch('/api/dealers', { signal: withDeadline(20000) });
-      if (!res.ok) throw new Error('Server returned ' + res.status);
-      const data = await res.json();
-      setDealers(data.dealers || []);
-      setError('');
-    } catch (e) {
-      setError(isTimeout(e)
-        ? 'The server took too long to respond. Tap Retry.'
-        : 'Could not load dealers. Check your connection and tap Retry.');
-    } finally {
-      setLoading(false);
-    }
+    const res = await fetch('/api/dealers');
+    const data = await res.json();
+    setDealers(data.dealers || []);
+    setLoading(false);
   }
 
   useEffect(() => { load(); }, []);
-
-  // Mutations used to fail silently — the screen just wouldn't change. Returns
-  // false so callers can keep the form filled in instead of wiping the input.
-  async function send(url, options) {
-    try {
-      const res = await fetch(url, { ...options, signal: withDeadline(20000) });
-      if (res.ok) {
-        setError('');
-        return true;
-      }
-      const body = await res.json().catch(() => ({}));
-      setError(body.error || 'That did not save (server returned ' + res.status + ').');
-      return false;
-    } catch (e) {
-      setError(isTimeout(e)
-        ? 'The server took too long to respond — nothing was saved. Try again.'
-        : 'Could not reach the server. Check your connection and try again.');
-      return false;
-    }
-  }
 
   async function addDealer() {
     const name = newName.trim();
@@ -177,32 +120,19 @@ export default function Dashboard() {
       return;
     }
     setDealerErr('');
-    const ok = await send('/api/dealers', {
+    const res = await fetch('/api/dealers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, phone: newPhone.trim() }),
     });
-    if (!ok) return;
-    setNewName(''); setNewPhone('');
-    await load();
+    if (res.ok) {
+      setNewName(''); setNewPhone('');
+      await load();
+    }
   }
 
-  // Deleting a dealer cascades every purchase and payment, with no undo, so make
-  // the person type the name rather than accepting a stray tap.
-  async function removeDealer(d) {
-    const t = totals(d);
-    const entries = (d.purchases || []).length + (d.payments || []).length;
-    const typed = window.prompt(
-      'Delete ' + d.name + ' and all ' + entries + ' ' + (entries === 1 ? 'entry' : 'entries') +
-      ' (' + fmt(t.purchased) + ' billed, ' + fmt(t.paid) + ' collected)?\n' +
-      'This cannot be undone.\n\nType the dealer name to confirm:'
-    );
-    if (typed === null) return;
-    if (typed.trim().toLowerCase() !== d.name.trim().toLowerCase()) {
-      setError('That name did not match — ' + d.name + ' was not deleted.');
-      return;
-    }
-    if (!(await send('/api/dealers/' + d.id, { method: 'DELETE' }))) return;
+  async function removeDealer(id) {
+    await fetch('/api/dealers/' + id, { method: 'DELETE' });
     await load();
   }
 
@@ -220,20 +150,18 @@ export default function Dashboard() {
       return;
     }
     setErrs((e) => ({ ...e, [dealerId + '-p']: '' }));
-    const ok = await send('/api/purchases', {
+    await fetch('/api/purchases', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ dealer_id: dealerId, product, qty, rate, date: f.pdate, due_date: f.duedate }),
     });
-    if (!ok) return; // keep what they typed so it isn't lost
     setFormState((s) => ({ ...s, [dealerId]: { ...s[dealerId], product: '', qty: '', rate: '', pdate: '', duedate: '' } }));
     await load();
     setOpenIds((o) => ({ ...o, [dealerId]: true }));
   }
 
-  async function removePurchase(p) {
-    if (!window.confirm('Remove ' + p.product + ' (' + fmt(p.qty * p.rate) + ')? This cannot be undone.')) return;
-    if (!(await send('/api/purchases/' + p.id, { method: 'DELETE' }))) return;
+  async function removePurchase(id) {
+    await fetch('/api/purchases/' + id, { method: 'DELETE' });
     await load();
   }
 
@@ -245,26 +173,118 @@ export default function Dashboard() {
       return;
     }
     setErrs((e) => ({ ...e, [dealerId + '-pay']: '' }));
-    const ok = await send('/api/payments', {
+    await fetch('/api/payments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ dealer_id: dealerId, amount, date: f.paydate, note: f.note }),
     });
-    if (!ok) return; // keep what they typed so it isn't lost
     setFormState((s) => ({ ...s, [dealerId]: { ...s[dealerId], amount: '', paydate: '', note: '' } }));
     await load();
     setOpenIds((o) => ({ ...o, [dealerId]: true }));
   }
 
-  async function removePayment(p) {
-    if (!window.confirm('Remove the ' + fmt(p.amount) + ' payment dated ' + p.date + '? This cannot be undone.')) return;
-    if (!(await send('/api/payments/' + p.id, { method: 'DELETE' }))) return;
+  async function removePayment(id) {
+    await fetch('/api/payments/' + id, { method: 'DELETE' });
     await load();
   }
 
   async function logout() {
-    await fetch('/api/logout', { method: 'POST' }).catch(() => {});
+    await fetch('/api/logout', { method: 'POST' });
     window.location.href = '/login';
+  }
+
+  // Read a sheet into objects keyed by our field names, keeping the real
+  // spreadsheet row number so skip messages can point the user at the row.
+  function readSheet(XLSX, wb, sheetName, map) {
+    const ws = wb.Sheets[sheetName];
+    if (!ws) return null;
+    const grid = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, raw: false });
+    // Find the header row: the first row containing "Dealer Name".
+    let headerIdx = -1;
+    for (let i = 0; i < grid.length; i++) {
+      if ((grid[i] || []).some((c) => String(c || '').trim().toLowerCase() === 'dealer name')) {
+        headerIdx = i;
+        break;
+      }
+    }
+    if (headerIdx === -1) return null;
+    const headers = (grid[headerIdx] || []).map((h) => String(h || '').trim().toLowerCase());
+    const out = [];
+    for (let i = headerIdx + 1; i < grid.length; i++) {
+      const cells = grid[i] || [];
+      if (!cells.some((c) => String(c || '').trim() !== '')) continue;
+      const obj = { _row: i + 1 };
+      Object.entries(map).forEach(([field, header]) => {
+        const col = headers.indexOf(header);
+        obj[field] = col === -1 ? '' : String(cells[col] ?? '').trim();
+      });
+      out.push(obj);
+    }
+    return out;
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ''; // let the same file be picked again later
+    if (!file) return;
+    setImportError('');
+    setImportResult(null);
+    try {
+      const XLSX = await import('xlsx');
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+
+      const dealersRows = readSheet(XLSX, wb, 'Dealers', { name: 'dealer name', phone: 'phone' });
+      const purchaseRows = readSheet(XLSX, wb, 'Purchases', {
+        dealer: 'dealer name', product: 'product', qty: 'qty', rate: 'rate',
+        date: 'purchase date', due_date: 'due date',
+      });
+      const paymentRows = readSheet(XLSX, wb, 'Payments', {
+        dealer: 'dealer name', amount: 'amount', date: 'payment date', note: 'note',
+      });
+
+      if (!dealersRows && !purchaseRows && !paymentRows) {
+        setImportError('No usable sheets found. The file needs sheets named Dealers, Purchases, or Payments, each with a "Dealer Name" column.');
+        return;
+      }
+
+      setPreview({
+        fileName: file.name,
+        dealers: dealersRows || [],
+        purchases: purchaseRows || [],
+        payments: paymentRows || [],
+      });
+    } catch (err) {
+      setImportError('Could not read that file. Make sure it is a .xlsx spreadsheet.');
+    }
+  }
+
+  async function confirmImport() {
+    if (!preview) return;
+    setImporting(true);
+    setImportError('');
+    try {
+      const res = await fetch('/api/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dealers: preview.dealers,
+          purchases: preview.purchases,
+          payments: preview.payments,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setImportError(data.error || 'Import failed.');
+      } else {
+        setImportResult(data);
+        setPreview(null);
+        await load();
+      }
+    } catch {
+      setImportError('Import failed. Check your connection and try again.');
+    }
+    setImporting(false);
   }
 
   function toggleSort(key) {
@@ -337,6 +357,16 @@ export default function Dashboard() {
       <div style={styles.topBar}>
         <h1 style={styles.h1}>BM Tiles — dealer dashboard</h1>
         <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            id="importFile"
+            type="file"
+            accept=".xlsx,.xls"
+            onChange={handleFile}
+            style={{ display: 'none' }}
+          />
+          <button style={styles.buttonSecondary} onClick={() => document.getElementById('importFile').click()}>
+            Import from Excel
+          </button>
           <button style={styles.buttonSecondary} onClick={exportToExcel} disabled={loading || dealers.length === 0}>
             Export to Excel
           </button>
@@ -345,10 +375,61 @@ export default function Dashboard() {
       </div>
       <p style={styles.sub}>Track dealer purchases and pending payments in one place.</p>
 
-      {error && (
-        <div style={styles.banner}>
-          <span>{error}</span>
-          <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={load}>Retry</button>
+      {importError && (
+        <div style={{ ...styles.card, borderColor: '#a32d2d', background: '#fcebeb', color: '#a32d2d', fontSize: 13.5 }}>
+          {importError}
+        </div>
+      )}
+
+      {importResult && (
+        <div style={{ ...styles.card, borderColor: '#3b6d11', background: '#eaf3de' }}>
+          <h2 style={{ ...styles.cardTitle, color: '#3b6d11' }}>Import finished</h2>
+          <div style={{ fontSize: 13.5, marginBottom: importResult.skipped.length ? 12 : 0 }}>
+            {importResult.dealersCreated} dealer(s) added · {importResult.dealersUpdated} updated ·{' '}
+            {importResult.purchasesAdded} purchase(s) · {importResult.paymentsAdded} payment(s) added.
+          </div>
+          {importResult.skipped.length > 0 && (
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: '#a32d2d', marginBottom: 6 }}>
+                {importResult.skipped.length} row(s) skipped:
+              </div>
+              <div style={{ maxHeight: 200, overflowY: 'auto', fontSize: 12.5 }}>
+                {importResult.skipped.map((s, i) => (
+                  <div key={i} style={{ marginBottom: 3 }}>
+                    {s.sheet} row {s.row}: {s.reason}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <button
+            style={{ ...styles.buttonSecondary, ...styles.buttonSmall, marginTop: 12 }}
+            onClick={() => setImportResult(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {preview && (
+        <div style={{ ...styles.card, borderColor: '#185fa5', background: '#e6f1fb' }}>
+          <h2 style={styles.cardTitle}>Review before importing</h2>
+          <div style={{ fontSize: 13.5, marginBottom: 10 }}>
+            <strong>{preview.fileName}</strong> contains {preview.dealers.length} dealer row(s),{' '}
+            {preview.purchases.length} purchase row(s), and {preview.payments.length} payment row(s).
+          </div>
+          <div style={{ fontSize: 12.5, color: '#6b6a63', marginBottom: 12 }}>
+            Nothing has been saved yet. Dealers already in the dashboard are matched by name and will not be
+            duplicated. Purchases and payments are always added, so importing the same file twice will double them.
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button style={styles.button} onClick={confirmImport} disabled={importing}>
+              {importing ? 'Importing…' : 'Confirm import'}
+            </button>
+            <button style={styles.buttonSecondary} onClick={() => setPreview(null)} disabled={importing}>
+              Cancel
+            </button>
+          </div>
         </div>
       )}
 
@@ -463,8 +544,7 @@ export default function Dashboard() {
         <h2 style={styles.cardTitle}>Dealers</h2>
 
         {loading && <div style={styles.empty}>Loading…</div>}
-        {!loading && !error && dealers.length === 0 && <div style={styles.empty}>No dealers yet. Add one above to get started.</div>}
-        {!loading && error && dealers.length === 0 && <div style={styles.empty}>Nothing loaded — see the message above.</div>}
+        {!loading && dealers.length === 0 && <div style={styles.empty}>No dealers yet. Add one above to get started.</div>}
 
         {!loading && dealers.map((d) => {
           const t = totals(d);
@@ -481,7 +561,7 @@ export default function Dashboard() {
                   <span style={styles.pill(t.pending > 0)}>{t.pending > 0 ? fmt(t.pending) + ' pending' : 'clear'}</span>
                   <button
                     style={{ ...styles.buttonSecondary, ...styles.buttonSmall }}
-                    onClick={(e) => { e.stopPropagation(); removeDealer(d); }}
+                    onClick={(e) => { e.stopPropagation(); removeDealer(d.id); }}
                   >
                     Delete
                   </button>
@@ -512,7 +592,7 @@ export default function Dashboard() {
                           <td style={styles.td}>{p.date}</td>
                           <td style={styles.td}>{p.due_date || '—'}</td>
                           <td style={styles.td}>
-                            <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePurchase(p)}>Remove</button>
+                            <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePurchase(p.id)}>Remove</button>
                           </td>
                         </tr>
                       ))}
@@ -544,7 +624,7 @@ export default function Dashboard() {
                           <td style={styles.td}>{p.date}</td>
                           <td style={styles.td}>{p.note}</td>
                           <td style={styles.td}>
-                            <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePayment(p)}>Remove</button>
+                            <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePayment(p.id)}>Remove</button>
                           </td>
                         </tr>
                       ))}
