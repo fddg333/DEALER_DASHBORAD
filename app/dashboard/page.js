@@ -37,10 +37,25 @@ const styles = {
   waButton: { background: '#25D366', color: '#fff', border: 'none', cursor: 'pointer', padding: '7px 14px', fontWeight: 500, borderRadius: 6, fontSize: 12.5, display: 'flex', alignItems: 'center', gap: 6 },
   waButtonDisabled: { background: '#c9c5b8', color: '#fff', cursor: 'not-allowed', padding: '7px 14px', fontWeight: 500, borderRadius: 6, fontSize: 12.5, border: 'none' },
   sortTh: { textAlign: 'left', color: '#8f8d84', fontWeight: 500, fontSize: 12, padding: '6px 8px', borderBottom: '1px solid #e1ded4', cursor: 'pointer', userSelect: 'none' },
+  banner: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap', background: '#fcebeb', border: '0.5px solid #e6bcbc', color: '#a32d2d', borderRadius: 10, padding: '10px 14px', fontSize: 13.5, marginBottom: 16 },
 };
 
 function fmt(n) {
   return '₹' + Number(n || 0).toLocaleString('en-IN');
+}
+
+// Some failures stall rather than reject — a sleeping database, a phone that
+// wandered off the wifi. Without a deadline the request never settles and the
+// screen sits on "Loading…" forever.
+function withDeadline(ms) {
+  if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) return AbortSignal.timeout(ms);
+  const c = new AbortController();
+  setTimeout(() => c.abort(), ms);
+  return c.signal;
+}
+
+function isTimeout(e) {
+  return e && (e.name === 'TimeoutError' || e.name === 'AbortError');
 }
 
 function totals(d) {
@@ -55,10 +70,26 @@ function daysBetween(dateStr) {
   return Math.round((due - today) / (1000 * 60 * 60 * 24));
 }
 
-// Earliest due_date among a dealer's purchases (only meaningful while pending > 0)
+// Payments aren't tied to individual purchases, so settle them oldest-bill-first
+// and report the earliest due date among the bills the payments don't cover.
+// Using the earliest due date outright would age the balance against a bill the
+// dealer already cleared, and that number goes into the WhatsApp reminder.
 function nextDueDate(d) {
-  const dates = (d.purchases || []).map((p) => p.due_date).filter(Boolean).sort();
-  return dates.length ? dates[0] : null;
+  const bills = [...(d.purchases || [])].sort(
+    (a, b) => (a.date || '').localeCompare(b.date || '') || (a.created_at || '').localeCompare(b.created_at || '')
+  );
+  let credit = (d.payments || []).reduce((s, p) => s + p.amount, 0);
+  const unsettled = [];
+  for (const b of bills) {
+    const amount = b.qty * b.rate;
+    if (credit >= amount) {
+      credit -= amount; // this bill is fully paid off
+      continue;
+    }
+    credit = 0; // partially paid at most; the rest of the bills are open
+    if (b.due_date) unsettled.push(b.due_date);
+  }
+  return unsettled.length ? unsettled.sort()[0] : null;
 }
 
 function reminderStatus(d) {
@@ -98,16 +129,46 @@ export default function Dashboard() {
   const [errs, setErrs] = useState({});
   const [sortKey, setSortKey] = useState('pending');
   const [sortDir, setSortDir] = useState('desc');
+  const [error, setError] = useState('');
 
   async function load() {
     setLoading(true);
-    const res = await fetch('/api/dealers');
-    const data = await res.json();
-    setDealers(data.dealers || []);
-    setLoading(false);
+    try {
+      const res = await fetch('/api/dealers', { signal: withDeadline(20000) });
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+      const data = await res.json();
+      setDealers(data.dealers || []);
+      setError('');
+    } catch (e) {
+      setError(isTimeout(e)
+        ? 'The server took too long to respond. Tap Retry.'
+        : 'Could not load dealers. Check your connection and tap Retry.');
+    } finally {
+      setLoading(false);
+    }
   }
 
   useEffect(() => { load(); }, []);
+
+  // Mutations used to fail silently — the screen just wouldn't change. Returns
+  // false so callers can keep the form filled in instead of wiping the input.
+  async function send(url, options) {
+    try {
+      const res = await fetch(url, { ...options, signal: withDeadline(20000) });
+      if (res.ok) {
+        setError('');
+        return true;
+      }
+      const body = await res.json().catch(() => ({}));
+      setError(body.error || 'That did not save (server returned ' + res.status + ').');
+      return false;
+    } catch (e) {
+      setError(isTimeout(e)
+        ? 'The server took too long to respond — nothing was saved. Try again.'
+        : 'Could not reach the server. Check your connection and try again.');
+      return false;
+    }
+  }
 
   async function addDealer() {
     const name = newName.trim();
@@ -116,19 +177,32 @@ export default function Dashboard() {
       return;
     }
     setDealerErr('');
-    const res = await fetch('/api/dealers', {
+    const ok = await send('/api/dealers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, phone: newPhone.trim() }),
     });
-    if (res.ok) {
-      setNewName(''); setNewPhone('');
-      await load();
-    }
+    if (!ok) return;
+    setNewName(''); setNewPhone('');
+    await load();
   }
 
-  async function removeDealer(id) {
-    await fetch('/api/dealers/' + id, { method: 'DELETE' });
+  // Deleting a dealer cascades every purchase and payment, with no undo, so make
+  // the person type the name rather than accepting a stray tap.
+  async function removeDealer(d) {
+    const t = totals(d);
+    const entries = (d.purchases || []).length + (d.payments || []).length;
+    const typed = window.prompt(
+      'Delete ' + d.name + ' and all ' + entries + ' ' + (entries === 1 ? 'entry' : 'entries') +
+      ' (' + fmt(t.purchased) + ' billed, ' + fmt(t.paid) + ' collected)?\n' +
+      'This cannot be undone.\n\nType the dealer name to confirm:'
+    );
+    if (typed === null) return;
+    if (typed.trim().toLowerCase() !== d.name.trim().toLowerCase()) {
+      setError('That name did not match — ' + d.name + ' was not deleted.');
+      return;
+    }
+    if (!(await send('/api/dealers/' + d.id, { method: 'DELETE' }))) return;
     await load();
   }
 
@@ -146,18 +220,20 @@ export default function Dashboard() {
       return;
     }
     setErrs((e) => ({ ...e, [dealerId + '-p']: '' }));
-    await fetch('/api/purchases', {
+    const ok = await send('/api/purchases', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ dealer_id: dealerId, product, qty, rate, date: f.pdate, due_date: f.duedate }),
     });
+    if (!ok) return; // keep what they typed so it isn't lost
     setFormState((s) => ({ ...s, [dealerId]: { ...s[dealerId], product: '', qty: '', rate: '', pdate: '', duedate: '' } }));
     await load();
     setOpenIds((o) => ({ ...o, [dealerId]: true }));
   }
 
-  async function removePurchase(id) {
-    await fetch('/api/purchases/' + id, { method: 'DELETE' });
+  async function removePurchase(p) {
+    if (!window.confirm('Remove ' + p.product + ' (' + fmt(p.qty * p.rate) + ')? This cannot be undone.')) return;
+    if (!(await send('/api/purchases/' + p.id, { method: 'DELETE' }))) return;
     await load();
   }
 
@@ -169,23 +245,25 @@ export default function Dashboard() {
       return;
     }
     setErrs((e) => ({ ...e, [dealerId + '-pay']: '' }));
-    await fetch('/api/payments', {
+    const ok = await send('/api/payments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ dealer_id: dealerId, amount, date: f.paydate, note: f.note }),
     });
+    if (!ok) return; // keep what they typed so it isn't lost
     setFormState((s) => ({ ...s, [dealerId]: { ...s[dealerId], amount: '', paydate: '', note: '' } }));
     await load();
     setOpenIds((o) => ({ ...o, [dealerId]: true }));
   }
 
-  async function removePayment(id) {
-    await fetch('/api/payments/' + id, { method: 'DELETE' });
+  async function removePayment(p) {
+    if (!window.confirm('Remove the ' + fmt(p.amount) + ' payment dated ' + p.date + '? This cannot be undone.')) return;
+    if (!(await send('/api/payments/' + p.id, { method: 'DELETE' }))) return;
     await load();
   }
 
   async function logout() {
-    await fetch('/api/logout', { method: 'POST' });
+    await fetch('/api/logout', { method: 'POST' }).catch(() => {});
     window.location.href = '/login';
   }
 
@@ -266,6 +344,13 @@ export default function Dashboard() {
         </div>
       </div>
       <p style={styles.sub}>Track dealer purchases and pending payments in one place.</p>
+
+      {error && (
+        <div style={styles.banner}>
+          <span>{error}</span>
+          <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={load}>Retry</button>
+        </div>
+      )}
 
       <div style={styles.metrics}>
         <div style={styles.metric}><div style={styles.metricLabel}>Total dealers</div><div style={styles.metricValue}>{dealers.length}</div></div>
@@ -378,7 +463,8 @@ export default function Dashboard() {
         <h2 style={styles.cardTitle}>Dealers</h2>
 
         {loading && <div style={styles.empty}>Loading…</div>}
-        {!loading && dealers.length === 0 && <div style={styles.empty}>No dealers yet. Add one above to get started.</div>}
+        {!loading && !error && dealers.length === 0 && <div style={styles.empty}>No dealers yet. Add one above to get started.</div>}
+        {!loading && error && dealers.length === 0 && <div style={styles.empty}>Nothing loaded — see the message above.</div>}
 
         {!loading && dealers.map((d) => {
           const t = totals(d);
@@ -395,7 +481,7 @@ export default function Dashboard() {
                   <span style={styles.pill(t.pending > 0)}>{t.pending > 0 ? fmt(t.pending) + ' pending' : 'clear'}</span>
                   <button
                     style={{ ...styles.buttonSecondary, ...styles.buttonSmall }}
-                    onClick={(e) => { e.stopPropagation(); removeDealer(d.id); }}
+                    onClick={(e) => { e.stopPropagation(); removeDealer(d); }}
                   >
                     Delete
                   </button>
@@ -426,7 +512,7 @@ export default function Dashboard() {
                           <td style={styles.td}>{p.date}</td>
                           <td style={styles.td}>{p.due_date || '—'}</td>
                           <td style={styles.td}>
-                            <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePurchase(p.id)}>Remove</button>
+                            <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePurchase(p)}>Remove</button>
                           </td>
                         </tr>
                       ))}
@@ -458,7 +544,7 @@ export default function Dashboard() {
                           <td style={styles.td}>{p.date}</td>
                           <td style={styles.td}>{p.note}</td>
                           <td style={styles.td}>
-                            <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePayment(p.id)}>Remove</button>
+                            <button style={{ ...styles.buttonSecondary, ...styles.buttonSmall }} onClick={() => removePayment(p)}>Remove</button>
                           </td>
                         </tr>
                       ))}

@@ -15,6 +15,7 @@ create table purchases (
   qty numeric not null,
   rate numeric not null,
   date date not null,
+  due_date date,
   created_at timestamptz default now()
 );
 
@@ -29,3 +30,7 @@ create table payments (
 
 -- Row level security is left off since all access goes through the app's
 -- server-side API routes using the service role key, not directly from the browser.
+
+-- If your project was created before due_date existed, run this once instead of
+-- recreating the table:
+--   alter table purchases add column if not exists due_date date;
