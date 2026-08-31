@@ -1,5 +1,6 @@
 'use client';
 import { useEffect, useState } from 'react';
+import ImportExcel from './ImportExcel';
 
 const styles = {
   wrap: { maxWidth: 1000, margin: '0 auto', padding: '24px 16px 64px' },
@@ -368,6 +369,8 @@ export default function Dashboard() {
         </div>
         {dealerErr && <div style={styles.err}>{dealerErr}</div>}
       </div>
+
+      <ImportExcel existingNames={dealers.map((d) => d.name)} onImported={load} />
 
       {(() => {
         const withStatus = dealers
